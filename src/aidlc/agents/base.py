@@ -169,6 +169,60 @@ class BaseAgent:
             if f.get("severity") == "blocker":
                 phase_status = "blocked"
 
+        if phase_status == "blocked":
+            # Collect all blocker findings
+            all_blockers = [f for f in phase_findings if f.get("severity") == "blocker"]
+            if updated_state:
+                for f in updated_state.get("findings", {}).get("open", []):
+                    if f.get("phase") == self.name and f.get("severity") == "blocker":
+                        if not any(bf.get("id") == f.get("id") for bf in all_blockers):
+                            all_blockers.append(f)
+
+            # If no artifact was written, or none named logical_name == self.name, write one
+            has_matching_artifact = False
+            for art_id in artifact_ids:
+                art_entry = self.state_manager.get_run(run_id).get("artifacts", {}).get(self.name)
+                if art_entry and art_entry.get("id") == art_id:
+                    has_matching_artifact = True
+                    break
+
+            if not has_matching_artifact:
+                finding_bullets = "\n".join(
+                    f"- **[{f.get('id', 'BLOCKER')}] {f.get('title', 'Finding')}**: {f.get('description', '')}"
+                    for f in all_blockers
+                ) or "- Critical contradiction or domain risk detected."
+
+                blocker_doc = f"""# {self.name.title()} Phase: BLOCKED
+
+## Phase Status: BLOCKED
+
+> **Action Required**: This phase is currently BLOCKED and requires developer review.
+> To unblock, review the details below and change `## Phase Status: BLOCKED` to `## Phase Status: CLEAR` (or `RESOLVED`), then re-run `aidlc run {self.name}`.
+
+## Blocker Findings
+{finding_bullets}
+
+---
+## Developer Resolution
+To accept the risk or confirm resolution, change `## Phase Status: BLOCKED` above to `## Phase Status: CLEAR`, then re-run:
+```bash
+aidlc run {self.name}
+```
+"""
+                blocker_art = self.artifact_store.store_artifact(
+                    run_id=run_id,
+                    phase=self.name,
+                    logical_name=self.name,
+                    type_=f"{self.name}_blocker",
+                    content=blocker_doc,
+                    agent_name=f"{self.name}-agent",
+                    verdict="fail",
+                    json_metadata={"status": "blocked", "blockers": all_blockers},
+                )
+                self.state_manager.add_artifact(run_id, blocker_art)
+                if blocker_art["id"] not in artifact_ids:
+                    artifact_ids.append(blocker_art["id"])
+
         cost_dict = {
             "inputTokens": total_input_tokens,
             "outputTokens": total_output_tokens,

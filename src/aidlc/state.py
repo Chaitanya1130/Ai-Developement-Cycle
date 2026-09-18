@@ -413,6 +413,225 @@ class StateManager:
         state = self.get_run(run_id)
         return state["phase_history"] if state else []
 
+    def has_unresolved_blockers(self, run_id: str) -> bool:
+        state = self.get_run(run_id)
+        if not state:
+            return False
+        if state.get("phase", {}).get("status") == "blocked":
+            return True
+        for f in state.get("findings", {}).get("open", []):
+            if f.get("severity") == "blocker":
+                return True
+        return False
+
+    def get_blocked_phase(self, run_id: str) -> Optional[str]:
+        state = self.get_run(run_id)
+        if not state:
+            return None
+        # Check open blocker findings
+        for f in state.get("findings", {}).get("open", []):
+            if f.get("severity") == "blocker":
+                return f.get("phase")
+        if state.get("phase", {}).get("status") == "blocked":
+            return state.get("phase", {}).get("current")
+        return None
+
+    def resolve_blocker_findings(self, run_id: str, phase: Optional[str] = None) -> List[str]:
+        state = self.get_run(run_id)
+        if not state:
+            return []
+
+        resolved_ids = []
+        remaining_open = []
+        state.setdefault("findings", {}).setdefault("resolved", [])
+        state["findings"].setdefault("open", [])
+
+        for f in state["findings"]["open"]:
+            is_match = (f.get("severity") == "blocker") and (phase is None or f.get("phase") == phase)
+            if is_match:
+                f_copy = dict(f)
+                f_copy["status"] = "resolved"
+                f_copy["resolved_at"] = current_iso_timestamp()
+                f_copy["resolution_note"] = "Resolved by developer via artifact edit"
+                state["findings"]["resolved"].append(f_copy)
+                resolved_ids.append(f.get("id"))
+                with self.conn:
+                    self.conn.execute(
+                        "UPDATE findings SET status = 'resolved' WHERE run_id = ? AND id = ?",
+                        (run_id, f.get("id")),
+                    )
+            else:
+                remaining_open.append(f)
+
+        state["findings"]["open"] = remaining_open
+
+        # If all blockers cleared, unblock run status if it was blocked
+        has_blocker_left = any(f.get("severity") == "blocker" for f in remaining_open)
+        if not has_blocker_left and state.get("phase", {}).get("status") == "blocked":
+            state["phase"]["status"] = "passed"
+
+        self.save_run_state(state)
+        self.sync_progress_file(run_id)
+        return resolved_ids
+
+    def generate_progress_markdown(self, run_id: str) -> str:
+        state = self.get_run(run_id)
+        if not state:
+            return "# AIDLC Progress Report\n\nNo run state found."
+
+        current_phase = state.get("phase", {}).get("current", "unknown")
+        current_status = state.get("phase", {}).get("status", "unknown").upper()
+        budget = state.get("budget", {})
+        artifacts = state.get("artifacts", {})
+        history = state.get("phase_history", [])
+        open_findings = state.get("findings", {}).get("open", [])
+        resolved_findings = state.get("findings", {}).get("resolved", [])
+
+        status_badge = "🟢 PASSED"
+        if current_status == "BLOCKED":
+            status_badge = "🔴 BLOCKED"
+        elif current_status == "RUNNING":
+            status_badge = "🟡 RUNNING"
+        elif current_status == "FAILED":
+            status_badge = "❌ FAILED"
+        elif current_status == "PAUSED":
+            status_badge = "⏸️ PAUSED"
+
+        lines = [
+            "# AIDLC Project Execution Progress",
+            "",
+            f"- **Run ID**: `{run_id}`",
+            f"- **Project / Story**: `{state.get('project_id')}` / `{state.get('story_id')}`",
+            f"- **Current Phase**: **{current_phase}**",
+            f"- **Overall Status**: {status_badge} (`{current_status}`)",
+            f"- **Updated**: {state.get('metadata', {}).get('updated_at', current_iso_timestamp())}",
+            "",
+            "---",
+            "",
+            "## 1. Lifecycle Phase Dashboard",
+            "",
+            "| Phase | Status | Attempts | Primary Artifact | Verdict / Summary |",
+            "| :--- | :---: | :---: | :--- | :--- |",
+        ]
+
+        ordered_phases = [
+            "intake", "scaffold", "spec", "analyze-risks", "create-test-plan",
+            "test-design", "build", "adversarial-review", "verify",
+            "align", "release", "retro"
+        ]
+
+        phase_history_map = {}
+        for h in history:
+            phase_history_map[h["phase"]] = h
+
+        for p in ordered_phases:
+            h = phase_history_map.get(p)
+            art = artifacts.get(p) or artifacts.get(p.replace("-", "_"))
+            art_link = f"`{art.get('content_uri')}`" if art else "*(none)*"
+
+            if h:
+                p_status = h.get("status", "pending").upper()
+                p_attempt = str(h.get("attempt", 1))
+                findings_cnt = len(h.get("findings", []))
+                summary = f"{findings_cnt} findings" if findings_cnt else "clean"
+            elif p == current_phase:
+                p_status = current_status
+                p_attempt = "1"
+                summary = "Active"
+            else:
+                p_status = "PENDING"
+                p_attempt = "-"
+                summary = "-"
+
+            status_icon = "⚪"
+            if p_status == "PASSED":
+                status_icon = "✅"
+            elif p_status == "BLOCKED":
+                status_icon = "🛑"
+            elif p_status in ("RUNNING", "ACTIVE"):
+                status_icon = "⏳"
+            elif p_status == "FAILED":
+                status_icon = "❌"
+
+            lines.append(f"| **{p}** | {status_icon} {p_status} | {p_attempt} | {art_link} | {summary} |")
+
+        lines.extend([
+            "",
+            "---",
+            "",
+            "## 2. Token Usage & Budget",
+            f"- **Tokens In**: {budget.get('tokens_in', 0):,}",
+            f"- **Tokens Out**: {budget.get('tokens_out', 0):,}",
+            f"- **Estimated Cost**: ${budget.get('actual', 0.0):.4f} / Budget Cap: ${budget.get('cap', 100.0):.2f}",
+            "",
+            "---",
+            "",
+            "## 3. Findings Ledger",
+        ])
+
+        if open_findings:
+            lines.append("### ⚠️ Open Findings")
+            for f in open_findings:
+                f_id = f.get("id", "FIND")
+                lines.append(f"- **[{f_id}] [{f.get('severity', 'info').upper()}]** (`{f.get('phase')}`) {f.get('title')}: {f.get('description', '')}")
+            lines.append("")
+        else:
+            lines.append("### Open Findings: None (All Clear)")
+            lines.append("")
+
+        if resolved_findings:
+            lines.append("### ✅ Resolved Findings")
+            for f in resolved_findings:
+                f_id = f.get("id", "FIND")
+                lines.append(f"- **[{f_id}] [RESOLVED]** (`{f.get('phase')}`) {f.get('title')}: {f.get('resolution_note', 'Resolved')}")
+            lines.append("")
+
+        lines.extend([
+            "---",
+            "",
+            "## 4. Current Stage & Next Steps",
+        ])
+
+        if current_status == "BLOCKED":
+            blocked_phase = self.get_blocked_phase(run_id) or current_phase
+            art = artifacts.get(blocked_phase)
+            art_uri = art.get("content_uri") if art else f".aidlc/artifacts/{run_id}/{blocked_phase}/"
+            lines.extend([
+                f"> [!CAUTION]",
+                f"> **Phase `{blocked_phase}` is currently BLOCKED.**",
+                f"> Check out the generated artifact to review the blocker:",
+                f"> - **Artifact**: `{art_uri}`",
+                f"> ",
+                f"> **To Unblock**:",
+                f"> 1. Open `{art_uri}`.",
+                f"> 2. Change `Status: BLOCKED` to `Status: CLEAR` (or `RESOLVED` / `PASS`).",
+                f"> 3. Re-run: `aidlc run {blocked_phase}`",
+            ])
+        elif current_phase == "completed" or current_status == "passed":
+            lines.append(f"Phase **{current_phase}** completed successfully. Ready for next phase.")
+        else:
+            lines.append(f"Currently in phase **{current_phase}** with status **{current_status}**.")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    def sync_progress_file(self, run_id: str) -> str:
+        md_content = self.generate_progress_markdown(run_id)
+
+        # 1. Write outside phase folders: .aidlc/artifacts/<run_id>/progress.md
+        artifacts_dir = os.path.join(self.workspace_dir, ".aidlc", "artifacts", run_id)
+        os.makedirs(artifacts_dir, exist_ok=True)
+        run_progress_path = os.path.join(artifacts_dir, "progress.md")
+        with open(run_progress_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        # 2. Write to project root: ./progress.md for instant developer visibility
+        root_progress_path = os.path.join(self.workspace_dir, "progress.md")
+        with open(root_progress_path, "w", encoding="utf-8") as f:
+            f.write(md_content)
+
+        return run_progress_path
+
     def close(self) -> None:
         self.conn.close()
 

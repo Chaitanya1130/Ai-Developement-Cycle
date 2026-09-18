@@ -90,9 +90,11 @@ def init(project_id: str, story_id: str):
     workspace = os.getcwd()
     sm = StateManager(workspace)
     run = sm.create_run(project_id=project_id, story_id=story_id)
+    sm.sync_progress_file(run["run_id"])
     click.echo(f"Initialized AIDLC workspace in {os.path.join(workspace, '.aidlc')}")
     click.echo(f"Created active run: {run['run_id']}")
     click.echo(f"Phase: {run['phase']['current']} | Status: {run['phase']['status']}")
+    click.echo(f"Generated execution progress tracker: ./progress.md")
 
     interview_path = os.path.join(workspace, "interview.md")
     if not os.path.exists(interview_path):
@@ -236,6 +238,24 @@ def run(
         "interview_file": interview_content,
     }
 
+    # Check if run is currently blocked by another phase
+    blocked_phase = sm.get_blocked_phase(active_run_id)
+    if sm.has_unresolved_blockers(active_run_id) and blocked_phase and phase != blocked_phase:
+        art = sm.get_run(active_run_id).get("artifacts", {}).get(blocked_phase)
+        art_uri = art.get("content_uri") if art else f".aidlc/artifacts/{active_run_id}/{blocked_phase}/"
+        click.echo("\n" + "=" * 64, err=True)
+        click.echo(f"  [AIDLC Error] Cannot execute phase '{phase}'.", err=True)
+        click.echo(f"  The run is BLOCKED at phase '{blocked_phase}' due to unresolved blocker findings.", err=True)
+        click.echo(f"  You cannot bypass a blocked phase.", err=True)
+        click.echo("=" * 64, err=True)
+        click.echo(f"Check out the artifact generated to know more:\n  • {art_uri}", err=True)
+        click.echo(f"\nProgress report updated at:\n  • progress.md", err=True)
+        click.echo("\nTo unblock:", err=True)
+        click.echo(f"  1. Open the artifact file above.", err=True)
+        click.echo(f"  2. Review the blocker details and change the status from BLOCKED to CLEAR (or RESOLVED / PASS).", err=True)
+        click.echo(f"  3. Re-run: aidlc run {blocked_phase}\n", err=True)
+        sys.exit(2)
+
     try:
         orch = Orchestrator(workspace_dir=workspace, provider_override=provider)
         active_provider, _ = orch.model_router.resolve_provider()
@@ -274,13 +294,31 @@ def run(
             click.echo(f"[AIDLC] Pipeline completed. Final phase: {final_state['phase']['current']} | Status: {final_state['phase']['status']}")
             if final_state["phase"]["status"] == "blocked":
                 click.echo("[AIDLC] Pipeline blocked! Human gate intervention required.")
+            if final_state.get("phase", {}).get("status") == "blocked":
+                blocked_p = sm.get_blocked_phase(active_run_id) or phase
+                art = final_state.get("artifacts", {}).get(blocked_p)
+                art_uri = art.get("content_uri") if art else f".aidlc/artifacts/{active_run_id}/{blocked_p}/"
+                click.echo("\n" + "=" * 64)
+                click.echo(f"  Phase '{blocked_p}' is BLOCKED.")
+                click.echo("=" * 64)
+                click.echo(f"Check out the artifact generated to know more:\n  • {art_uri}")
+                click.echo(f"\nProgress report updated at:\n  • progress.md")
+                click.echo("\nTo unblock:")
+                click.echo(f"  1. Open the artifact file above.")
+                click.echo(f"  2. Review the blocker details and change the status from BLOCKED to CLEAR (or RESOLVED / PASS).")
+                click.echo(f"  3. Re-run: aidlc run {blocked_p} --pipeline")
+                click.echo("=" * 64 + "\n")
                 sys.exit(2)
             elif final_state["phase"]["status"] == "failed":
+            elif final_state.get("phase", {}).get("status") == "failed":
                 click.echo("[AIDLC] Pipeline failed.")
                 sys.exit(1)
             elif final_state["phase"]["status"] == "paused":
+            elif final_state.get("phase", {}).get("status") == "paused":
                 click.echo("[AIDLC] Pipeline paused at user gate.")
                 sys.exit(0)
+            else:
+                click.echo(f"[AIDLC] Pipeline completed. Final phase: {final_state['phase']['current']} | Status: {final_state['phase']['status']}")
         except Exception as e:
             click.echo(f"[AIDLC Error] Pipeline execution error: {e}", err=True)
             sys.exit(1)
@@ -288,6 +326,26 @@ def run(
         click.echo(f"[AIDLC] Executing phase '{phase}' for run {active_run_id}...")
         try:
             result = orch.execute_phase(run_id=active_run_id, phase_name=phase, context=context)
+
+            if result.status == "blocked":
+                art = sm.get_run(active_run_id).get("artifacts", {}).get(phase)
+                art_uri = art.get("content_uri") if art else f".aidlc/artifacts/{active_run_id}/{phase}/"
+                click.echo("\n" + "=" * 64)
+                click.echo(f"  Phase '{phase}' is BLOCKED.")
+                click.echo("=" * 64)
+                click.echo(f"Check out the artifact generated to know more:\n  • {art_uri}")
+                click.echo(f"\nProgress report updated at:\n  • progress.md")
+                click.echo("\nTo unblock:")
+                click.echo(f"  1. Open the artifact file above.")
+                click.echo(f"  2. Review the blocker details and change the status from BLOCKED to CLEAR (or RESOLVED / PASS).")
+                click.echo(f"  3. Re-run: aidlc run {phase}")
+                click.echo("=" * 64 + "\n")
+                sys.exit(2)
+
+            if "unblocked by developer" in (result.summary or "").lower():
+                click.echo(f"\n[AIDLC] Detected developer resolution in artifact (Status: CLEAR).")
+                click.echo(f"[AIDLC] Resolving blocker findings and unblocking phase '{phase}'...")
+
             click.echo(f"\n--- Phase '{phase}' Result ---")
             click.echo(f"Status: {result.status.upper()}")
             if result.summary:
@@ -303,6 +361,7 @@ def run(
             click.echo(
                 f"Usage: {cost.get('inputTokens', 0)} in / {cost.get('outputTokens', 0)} out | Est Cost: ${cost.get('cost', 0.0):.4f}"
             )
+            click.echo(f"Progress updated: ./progress.md")
 
             if phase == "intake" and result.status == "passed":
                 render_intake_interview_summary(sm, active_run_id)
@@ -324,6 +383,7 @@ def run(
                 click.echo("\n[AIDLC] Execution BLOCKED. Human intervention or clarification required.")
                 sys.exit(2)
             elif result.status == "failed":
+            if result.status == "failed":
                 click.echo("\n[AIDLC] Phase execution FAILED.")
                 sys.exit(1)
         except NotImplementedError as nie:

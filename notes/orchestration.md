@@ -294,7 +294,36 @@ sequenceDiagram
 
 ### Key Human Gates:
 1. **Intake & Discovery Gate**: Following the intake phase, the CLI displays a formatted architectural alignment summary (methodology, architecture style, persistence strategy, test harness) and requires user confirmation before proceeding to code scaffolding. Passing `-y` or `--yes` bypasses this confirmation for CI/CD environments.
-2. **Blocker Finding Halt**: When `analyze-risks` or other phases encounter unresolvable contradictions (and retry budgets are exhausted), the engine marks the pipeline as `status="blocked"` and exits with code `2`. The developer can resolve the finding in state or update the specification, then resume execution seamlessly.
+2. **Strict Phase Gating & Blocker Bypass Prevention**:
+   - If a phase encounters critical contradictions or blocker findings, it terminates with `status="blocked"`.
+   - Once a run is blocked, **downstream phases cannot be run**. Any attempt to execute a later phase (e.g. `aidlc run build` while `spec` or `analyze-risks` is blocked) is rejected with an explicit error explaining the blocker.
+   - Phases also enforce prerequisite completion: a phase cannot run unless its required predecessor has completed with `status="passed"`.
+3. **Minimal Clean Terminal Output on Block**:
+   - When a phase blocks, verbose terminal logs, token counts, and finding dumps are suppressed.
+   - The CLI outputs only a clean notification with the exact generated artifact path and instructions on how to unblock:
+     ```text
+     ============================================================
+     Phase 'spec' is BLOCKED.
+     ============================================================
+     Check out the artifact generated to know more:
+       • .aidlc/artifacts/<run_id>/spec/spec.v001.md
+
+     Progress report updated at:
+       • progress.md
+
+     To unblock:
+       1. Open the artifact file above.
+       2. Review the blocker details and change the status from BLOCKED to CLEAR (or RESOLVED / PASS).
+       3. Re-run: aidlc run spec
+     ============================================================
+     ```
+4. **Artifact-Driven Human Unblocking**:
+   - When a phase blocks, it generates an artifact containing `## Phase Status: BLOCKED` and the finding details.
+   - To unblock, the developer opens the artifact file on disk and changes `## Phase Status: BLOCKED` to `## Phase Status: CLEAR` (or `RESOLVED` / `APPROVED` / `PASS`).
+   - When the phase is re-run (`aidlc run <phase>`), the orchestrator inspects the artifact on disk, detects the developer's resolution, clears all blocker findings in SQLite state, transitions the phase to `passed`, and allows pipeline execution to continue.
+5. **Real-Time `progress.md` Dashboard**:
+   - Outside all phase directories, AIDLC automatically writes and updates `.aidlc/artifacts/<run_id>/progress.md` and `./progress.md`.
+   - Displays a live table of every phase's status, attempt count, artifact links, token usage/budget, open/resolved findings, and current next steps.
 
 ---
 

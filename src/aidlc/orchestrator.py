@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from aidlc.agents.base import BaseAgent, PhaseResult
@@ -30,6 +31,21 @@ PHASE_ALIASES = {
     "create_test_plan": "create-test-plan",
     "test_design": "test-design",
 }
+
+PIPELINE_ORDER = [
+    "intake",
+    "scaffold",
+    "spec",
+    "analyze-risks",
+    "create-test-plan",
+    "test-design",
+    "build",
+    "adversarial-review",
+    "verify",
+    "align",
+    "release",
+    "retro",
+]
 
 
 def normalize_phase(phase: str) -> str:
@@ -171,9 +187,131 @@ class Orchestrator:
         context: Optional[Dict[str, Any]] = None,
     ) -> PhaseResult:
         canonical = normalize_phase(phase_name)
+        state = self.state_manager.get_run(run_id)
+        if not state:
+            raise ValueError(f"Run '{run_id}' not found")
+
+        # 1. Check if run is currently blocked by another phase
+        blocked_phase = self.state_manager.get_blocked_phase(run_id)
+        has_blockers = self.state_manager.has_unresolved_blockers(run_id)
+
+        if has_blockers and blocked_phase and canonical != blocked_phase:
+            art = state.get("artifacts", {}).get(blocked_phase)
+            art_uri = art.get("content_uri") if art else f".aidlc/artifacts/{run_id}/{blocked_phase}/"
+            raise RuntimeError(
+                f"Cannot execute phase '{canonical}'. The run is BLOCKED at phase '{blocked_phase}'.\n"
+                f"You cannot bypass a blocked phase.\n"
+                f"Check out the artifact at: {art_uri}\n"
+                f"Resolve the blocker in the artifact and re-run 'aidlc run {blocked_phase}' first."
+            )
+
+        # 2. Check if the current phase was blocked, and whether developer unblocked it by editing the artifact
+        if has_blockers and canonical == blocked_phase:
+            art_entry = state.get("artifacts", {}).get(canonical)
+            latest_content = None
+            latest_path = None
+            if art_entry and art_entry.get("content_uri"):
+                full_path = os.path.join(self.workspace_dir, art_entry["content_uri"])
+                if os.path.exists(full_path):
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        latest_content = f.read()
+                    latest_path = full_path
+
+            if not latest_content:
+                alias_names = [canonical, canonical.replace("-", "_"), "risk-report", "spec", "specification"]
+                for an in alias_names:
+                    res = self.artifact_store.get_latest_artifact_content(run_id, canonical, an)
+                    if res:
+                        latest_content, latest_path = res
+                        break
+
+            if latest_content:
+                unblock_match = re.search(
+                    r"(?:status|verdict|state)\s*:\s*(clear|resolved|approved|pass|passed|unblocked|accept|accepted)",
+                    latest_content,
+                    re.IGNORECASE,
+                )
+                if unblock_match:
+                    # Developer unblocked via artifact edit!
+                    self.state_manager.resolve_blocker_findings(run_id, phase=canonical)
+                    updated_state = self.state_manager.get_run(run_id)
+                    if updated_state:
+                        updated_state["phase"]["current"] = canonical
+                        updated_state["phase"]["status"] = "passed"
+                        for h in updated_state.get("phase_history", []):
+                            if h["phase"] == canonical:
+                                h["status"] = "passed"
+                        if art_entry:
+                            art_entry["verdict"] = "pass"
+                            updated_state.setdefault("artifacts", {})[canonical] = art_entry
+                        self.state_manager.save_run_state(updated_state)
+
+                    with self.state_manager.conn:
+                        self.state_manager.conn.execute(
+                            "UPDATE phase_history SET status = 'passed' WHERE run_id = ? AND phase = ?",
+                            (run_id, canonical),
+                        )
+                        if art_entry and art_entry.get("id"):
+                            self.state_manager.conn.execute(
+                                "UPDATE artifacts SET verdict = 'pass' WHERE run_id = ? AND id = ?",
+                                (run_id, art_entry["id"]),
+                            )
+
+                    self.state_manager.sync_progress_file(run_id)
+
+                    rel_path = os.path.relpath(latest_path, self.workspace_dir) if latest_path else (art_entry.get("content_uri") if art_entry else "")
+                    return PhaseResult(
+                        phase=canonical,
+                        status="passed",
+                        artifact_ids=[art_entry["id"]] if (art_entry and art_entry.get("id")) else [],
+                        findings=[],
+                        summary=f"Unblocked by developer via artifact edit ({rel_path}).",
+                    )
+                else:
+                    # Artifact has not been changed to CLEAR
+                    rel_path = os.path.relpath(latest_path, self.workspace_dir) if latest_path else (art_entry.get("content_uri") if art_entry else "")
+                    return PhaseResult(
+                        phase=canonical,
+                        status="blocked",
+                        artifact_ids=[art_entry["id"]] if (art_entry and art_entry.get("id")) else [],
+                        summary=f"Phase remains blocked. Artifact has not been changed to CLEAR ({rel_path}).",
+                    )
+
+        # 3. Check phase prerequisites (cannot jump ahead without predecessor passing)
+        PHASE_PREREQUISITES = {
+            "scaffold": ["intake"],
+            "spec": ["intake"],
+            "analyze-risks": ["spec"],
+            "create-test-plan": ["spec"],
+            "test-design": ["spec"],
+            "build": ["spec"],
+            "adversarial-review": ["build"],
+            "verify": ["build"],
+            "align": ["build", "spec"],
+            "release": ["verify"],
+            "retro": ["verify"],
+        }
+        required_preds = PHASE_PREREQUISITES.get(canonical, [])
+        history_phases = {h["phase"]: h.get("status") for h in state.get("phase_history", [])}
+        artifacts = state.get("artifacts", {})
+
+        for pred in required_preds:
+            pred_status = history_phases.get(pred)
+            pred_art = artifacts.get(pred) or artifacts.get(pred.replace("-", "_"))
+            if pred_status != "passed" and not (pred_art and pred_art.get("verdict") in ("pass", "info")):
+                raise RuntimeError(
+                    f"Cannot execute phase '{canonical}'. Predecessor phase '{pred}' must be completed with status 'passed' first (currently: '{pred_status or 'not run'}')."
+                )
+
         agent = self.get_agent(canonical)
         ctx = dict(context or {})
         ctx["run_id"] = run_id
+
+        # Update run state to running
+        state["phase"]["current"] = canonical
+        state["phase"]["status"] = "running"
+        self.state_manager.save_run_state(state)
+        self.state_manager.sync_progress_file(run_id)
 
         result = agent.run(run_id, ctx)
 
@@ -183,6 +321,7 @@ class Orchestrator:
             state["phase"]["current"] = canonical
             state["phase"]["status"] = result.status
             self.state_manager.save_run_state(state)
+            self.state_manager.sync_progress_file(run_id)
 
         return result
 
@@ -215,6 +354,7 @@ class Orchestrator:
             if attempts >= limit:
                 state["phase"]["status"] = "failed"
                 self.state_manager.save_run_state(state)
+                self.state_manager.sync_progress_file(run_id)
                 raise RuntimeError(
                     f"Retry budget exceeded for phase '{current_phase}' ({attempts}/{limit} attempts)."
                 )
@@ -230,6 +370,8 @@ class Orchestrator:
                         context = {"findings": result.findings, "retry": True}
                         continue
                 # Otherwise halt pipeline
+                # Blocker encountered: Halt pipeline immediately and sync progress
+                self.state_manager.sync_progress_file(run_id)
                 break
 
             elif result.status == "passed":

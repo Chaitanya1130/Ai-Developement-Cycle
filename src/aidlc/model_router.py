@@ -631,6 +631,27 @@ agent_generated
 
             # Check contradiction
             if is_human and ("Python" in last_content or "Flask" in last_content or "web API" in last_content):
+                spec_blocker_md = """# Specification: BLOCKED
+
+## Phase Status: BLOCKED
+
+> **Action Required**: This phase is currently BLOCKED due to a contradiction between human-supplied stories and intake requirements.
+> To unblock, review the details below and change `## Phase Status: BLOCKED` to `## Phase Status: CLEAR` (or `RESOLVED`), then re-run `aidlc run spec`.
+
+## Blocker Findings
+- **ID**: BLOCKER-001
+- **Severity**: blocker
+- **Category**: scope
+- **Title**: Contradiction between human story and intake constraints
+- **Description**: Human story requests Python web API microservice, which contradicts CLI intake.
+
+---
+## Developer Resolution
+Change `## Phase Status: BLOCKED` above to `## Phase Status: CLEAR` once you accept or resolve this, then re-run:
+```bash
+aidlc run spec
+```
+"""
                 return ModelResponse(
                     text="Contradiction detected: Human story requests Python web API contradicting CLI calculator intake.",
                     tool_calls=[
@@ -643,6 +664,20 @@ agent_generated
                                 "category": "scope",
                                 "title": "Contradiction between human story and intake constraints",
                                 "description": "Human story requests Python web API microservice, which contradicts CLI intake.",
+                            },
+                        ),
+                        ToolCall(
+                            id=f"call_art_{int(time.time() * 1000)}",
+                            name="write_artifact",
+                            input={
+                                "logical_name": "spec",
+                                "type": "spec_blocker",
+                                "content": spec_blocker_md,
+                                "verdict": "fail",
+                                "json_metadata": {
+                                    "status": "blocked",
+                                    "blocker_id": "BLOCKER-001",
+                                },
                             },
                         ),
                         ToolCall(

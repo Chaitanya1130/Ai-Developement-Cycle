@@ -2,6 +2,14 @@ import os
 import shutil
 import tempfile
 import pytest
+try:
+    import pytest
+except ImportError:
+    class _MockPytest:
+        @staticmethod
+        def fixture(func):
+            return func
+    pytest = _MockPytest()
 from click.testing import CliRunner
 
 from aidlc.state import StateManager
@@ -205,3 +213,75 @@ class TestCLICommands:
             assert res_intake.exit_code == 0
             assert "Phase 'intake' Result" in res_intake.output
             assert "Status: PASSED" in res_intake.output
+            assert os.path.exists("progress.md")
+
+    def test_blocker_minimal_output_and_bypass_prevention(self, temp_workspace):
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=temp_workspace):
+            runner.invoke(cli, ["init"])
+            runner.invoke(cli, ["run", "intake", "--provider", "mock", "-y"])
+
+            # Run spec with contradicting stories (triggers blocker in mock adapter)
+            res_spec = runner.invoke(
+                cli,
+                ["run", "spec", "--mode", "human_supplied", "--stories", "Build Python Flask web API microservice", "--provider", "mock"],
+            )
+            # Exit code 2 for blocked
+            assert res_spec.exit_code == 2
+            # Terminal output must be clean and minimal
+            assert "Phase 'spec' is BLOCKED." in res_spec.output
+            assert "Check out the artifact generated to know more:" in res_spec.output
+            assert "progress.md" in res_spec.output
+            # Should NOT show token usage or raw findings dump
+            assert "Usage: " not in res_spec.output
+            assert "Findings (1):" not in res_spec.output
+
+            # Attempt to bypass blocked phase by running build
+            res_build = runner.invoke(cli, ["run", "build", "--provider", "mock"])
+            assert res_build.exit_code == 2
+            assert "Cannot execute phase 'build'" in res_build.output
+            assert "You cannot bypass a blocked phase" in res_build.output
+
+            # Check that progress.md reflects the blocked state
+            with open("progress.md", "r", encoding="utf-8") as f:
+                prog = f.read()
+            assert "🔴 BLOCKED" in prog or "🛑 BLOCKED" in prog
+
+    def test_artifact_driven_unblock(self, temp_workspace):
+        runner = CliRunner()
+        with runner.isolated_filesystem(temp_dir=temp_workspace):
+            runner.invoke(cli, ["init"])
+            runner.invoke(cli, ["run", "intake", "--provider", "mock", "-y"])
+
+            # Trigger blocker
+            res_block = runner.invoke(
+                cli,
+                ["run", "spec", "--mode", "human_supplied", "--stories", "Build Python Flask web API microservice", "--provider", "mock"],
+            )
+            assert res_block.exit_code == 2
+
+            # Find the generated spec blocker artifact
+            sm = StateManager(os.getcwd())
+            active_id = sm.get_active_run_id()
+            art = sm.get_run(active_id)["artifacts"]["spec"]
+            art_file = art["content_uri"]
+
+            # Edit artifact on disk: change BLOCKED to CLEAR
+            with open(art_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            assert "## Phase Status: BLOCKED" in content
+            content = content.replace("## Phase Status: BLOCKED", "## Phase Status: CLEAR")
+            with open(art_file, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            # Re-run spec
+            res_rerun = runner.invoke(cli, ["run", "spec", "--provider", "mock"])
+            assert res_rerun.exit_code == 0
+            assert "Detected developer resolution in artifact (Status: CLEAR)" in res_rerun.output
+            assert "Status: PASSED" in res_rerun.output
+            assert "Unblocked by developer" in res_rerun.output
+
+            # Now build can be executed (or pipeline can continue) without being blocked!
+            res_analyze = runner.invoke(cli, ["run", "analyze-risks", "--provider", "mock"])
+            assert res_analyze.exit_code == 0
+            assert "Phase 'analyze-risks' Result" in res_analyze.output

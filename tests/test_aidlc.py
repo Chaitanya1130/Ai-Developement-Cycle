@@ -185,6 +185,47 @@ class TestModelRouter:
         expected_cost = (in_tokens * 3.0) / 1_000_000 + (out_tokens * 15.0) / 1_000_000
         assert expected_cost > 1.0  # Around $1.144
 
+    def test_openai_and_codex_provider_resolution(self, monkeypatch=None):
+        from aidlc.model_router import OpenAIAdapter
+        # When key is set
+        os.environ["OPENAI_API_KEY"] = "sk-test-key-123"
+        try:
+            router_openai = ModelRouter(provider_override="openai")
+            p_name, adapter = router_openai.resolve_provider()
+            assert p_name == "openai"
+            assert isinstance(adapter, OpenAIAdapter)
+
+            router_codex = ModelRouter(provider_override="codex")
+            p_name_codex, adapter_codex = router_codex.resolve_provider()
+            assert p_name_codex == "openai"
+            assert isinstance(adapter_codex, OpenAIAdapter)
+        finally:
+            os.environ.pop("OPENAI_API_KEY", None)
+
+    def test_claude_alias_resolution(self):
+        from aidlc.model_router import AnthropicAdapter
+        os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-123"
+        try:
+            router_claude = ModelRouter(provider_override="claude")
+            p_name, adapter = router_claude.resolve_provider()
+            assert p_name == "anthropic"
+            assert isinstance(adapter, AnthropicAdapter)
+        finally:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+
+    def test_openai_adapter_availability(self):
+        from aidlc.model_router import OpenAIAdapter
+        adapter = OpenAIAdapter(api_key="sk-test-123")
+        assert adapter.is_available() is True
+        adapter_empty = OpenAIAdapter(api_key="")
+        # When no env var
+        old = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            assert adapter_empty.is_available() is False
+        finally:
+            if old:
+                os.environ["OPENAI_API_KEY"] = old
+
 
 class TestCLICommands:
     def test_cli_init_and_status(self, temp_workspace):

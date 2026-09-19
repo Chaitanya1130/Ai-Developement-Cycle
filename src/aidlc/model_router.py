@@ -157,6 +157,144 @@ class AnthropicAdapter(ModelProviderAdapter):
         )
 
 
+class OpenAIAdapter(ModelProviderAdapter):
+    name = "openai"
+
+    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
+        self._client = None
+
+    def is_available(self) -> bool:
+        key = self.api_key or os.getenv("OPENAI_API_KEY")
+        return bool(key and key.strip())
+
+    def _get_client(self):
+        if self._client is None:
+            try:
+                import openai
+                key = self.api_key or os.getenv("OPENAI_API_KEY")
+                if not key:
+                    raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+                kwargs = {"api_key": key}
+                base_url = self.base_url or os.getenv("OPENAI_BASE_URL")
+                if base_url:
+                    kwargs["base_url"] = base_url
+                self._client = openai.OpenAI(**kwargs)
+            except ImportError:
+                raise RuntimeError(
+                    "The 'openai' Python package is not installed. Install with 'pip install openai'."
+                )
+        return self._client
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        client = self._get_client()
+
+        # Model selection: explicit request, or tier-based default
+        if request.model:
+            model_name = request.model
+        elif request.tier == "tier1":
+            model_name = "gpt-4o-mini"
+        elif request.tier == "tier3":
+            model_name = "o1"
+        else:
+            model_name = "gpt-4o"
+
+        messages = []
+        if request.system:
+            messages.append({"role": "system", "content": request.system})
+
+        for m in request.messages:
+            if isinstance(m.content, str):
+                messages.append({"role": m.role, "content": m.content})
+            elif isinstance(m.content, list):
+                for part in m.content:
+                    if part.get("type") == "tool_result":
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": part.get("tool_use_id", ""),
+                            "content": str(part.get("content", "")),
+                        })
+                    elif part.get("type") == "tool_use":
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": part.get("id", ""),
+                                    "type": "function",
+                                    "function": {
+                                        "name": part.get("name", ""),
+                                        "arguments": json.dumps(part.get("input", {})),
+                                    },
+                                }
+                            ],
+                        })
+                    elif part.get("type") == "text":
+                        messages.append({"role": m.role, "content": part.get("text", "")})
+
+        tools_param = None
+        if request.tools:
+            tools_param = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    },
+                }
+                for t in request.tools
+            ]
+
+        kwargs: Dict[str, Any] = {
+            "model": model_name,
+            "messages": messages,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+        }
+        if tools_param:
+            kwargs["tools"] = tools_param
+            kwargs["tool_choice"] = "auto"
+
+        resp = client.chat.completions.create(**kwargs)
+
+        choice = resp.choices[0]
+        text = choice.message.content or ""
+        tool_calls = []
+
+        if choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except Exception:
+                    args = {}
+                tool_calls.append(
+                    ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        input=args,
+                    )
+                )
+
+        in_tokens = getattr(resp.usage, "prompt_tokens", 0) if resp.usage else 0
+        out_tokens = getattr(resp.usage, "completion_tokens", 0) if resp.usage else 0
+
+        # Cost estimate based on gpt-4o ($2.50/M in, $10.00/M out) or gpt-4o-mini ($0.15/M in, $0.60/M out)
+        if "mini" in model_name.lower():
+            cost = (in_tokens * 0.15) / 1_000_000 + (out_tokens * 0.60) / 1_000_000
+        else:
+            cost = (in_tokens * 2.50) / 1_000_000 + (out_tokens * 10.00) / 1_000_000
+
+        return ModelResponse(
+            text=text,
+            tool_calls=tool_calls,
+            usage=ModelUsage(input_tokens=in_tokens, output_tokens=out_tokens, cost_estimate=cost),
+            stop_reason="tool_use" if tool_calls else "end_turn",
+            raw_content=resp,
+        )
+
+
 class AgyAdapter(ModelProviderAdapter):
     name = "agy"
 
@@ -1104,6 +1242,7 @@ class ModelRouter:
         self.provider_override = provider_override
         self.adapters: Dict[str, ModelProviderAdapter] = {
             "anthropic": AnthropicAdapter(),
+            "openai": OpenAIAdapter(),
             "agy": AgyAdapter(),
             "mock": MockAdapter(),
         }
@@ -1115,10 +1254,16 @@ class ModelRouter:
             if p == "mock":
                 return "mock", self.adapters["mock"]
             elif p == "anthropic":
+            elif p in ("anthropic", "claude"):
                 adapter = self.adapters["anthropic"]
                 if not adapter.is_available():
                     raise RuntimeError("ANTHROPIC_API_KEY is not set or empty in environment")
                 return "anthropic", adapter
+            elif p in ("openai", "codex", "chatgpt"):
+                adapter = self.adapters["openai"]
+                if not adapter.is_available():
+                    raise RuntimeError("OPENAI_API_KEY is not set or empty in environment")
+                return "openai", adapter
             elif p == "agy":
                 adapter = self.adapters["agy"]
                 if not adapter.is_available():
@@ -1126,11 +1271,19 @@ class ModelRouter:
                 return "agy", adapter
             else:
                 raise ValueError(f"Unsupported provider: '{self.provider_override}'. Choose from: anthropic, agy, mock.")
+                raise ValueError(
+                    f"Unsupported provider: '{self.provider_override}'. Choose from: anthropic, openai, agy, mock."
+                )
 
         # 2. Priority: ANTHROPIC_API_KEY -> agy -> explicit error
+        # 2. Priority: ANTHROPIC_API_KEY -> OPENAI_API_KEY -> agy -> explicit error
         anthropic_adapter = self.adapters["anthropic"]
         if anthropic_adapter.is_available():
             return "anthropic", anthropic_adapter
+
+        openai_adapter = self.adapters["openai"]
+        if openai_adapter.is_available():
+            return "openai", openai_adapter
 
         agy_adapter = self.adapters["agy"]
         if agy_adapter.is_available():
@@ -1140,6 +1293,9 @@ class ModelRouter:
         raise RuntimeError(
             "No LLM provider available. Neither ANTHROPIC_API_KEY is configured nor was an authenticated agy CLI found. "
             "Set ANTHROPIC_API_KEY, authenticate agy, or pass --provider mock explicitly."
+            "No LLM provider available. Neither ANTHROPIC_API_KEY nor OPENAI_API_KEY is configured, "
+            "nor was an authenticated agy CLI found. "
+            "Set ANTHROPIC_API_KEY, OPENAI_API_KEY, authenticate agy, or pass --provider mock explicitly."
         )
 
     def complete(self, request: ModelRequest) -> ModelResponse:

@@ -164,9 +164,21 @@ By default, `aidlc` resolves providers in this priority:
 1. Explicit `--provider` flag
 2. `ANTHROPIC_API_KEY` (Anthropic API)
 3. `agy` CLI (Google Antigravity model provider)
+2. `ANTHROPIC_API_KEY` (Anthropic Claude API)
+3. `OPENAI_API_KEY` (OpenAI GPT-4o / Codex API)
+4. `agy` CLI (Google Antigravity model provider)
 
 To override the provider for any run:
 ```bash
+# Run with Anthropic Claude
+export ANTHROPIC_API_KEY="sk-ant-..."
+aidlc run intake --provider anthropic
+
+# Run with OpenAI / Codex
+export OPENAI_API_KEY="sk-..."
+aidlc run intake --provider openai
+# (or: aidlc run intake --provider codex)
+
 # Run with Antigravity
 aidlc run intake --provider agy
 

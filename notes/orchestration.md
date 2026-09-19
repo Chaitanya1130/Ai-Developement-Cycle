@@ -235,17 +235,25 @@ AIDLC is LLM-agnostic and abstracts model providers behind a unified interface:
 flowchart TD
     Req[Model Request] --> Router[ModelRouter.resolve_provider]
     Router --> CheckOverride{--provider flag passed?}
-    CheckOverride -- Yes --> UseFlag[Use Explicit Provider: anthropic / agy / mock]
+    CheckOverride -- Yes --> UseFlag[Use Explicit Provider: anthropic / openai / codex / agy / mock]
     CheckOverride -- No --> CheckAnthropic{ANTHROPIC_API_KEY set?}
     CheckAnthropic -- Yes --> UseAnthropic[AnthropicAdapter: claude-3-5-sonnet]
-    CheckAnthropic -- No --> CheckAgy{agy CLI available & authenticated?}
+    CheckAnthropic -- No --> CheckOpenAI{OPENAI_API_KEY set?}
+    CheckOpenAI -- Yes --> UseOpenAI[OpenAIAdapter: gpt-4o / codex]
+    CheckOpenAI -- No --> CheckAgy{agy CLI available & authenticated?}
     CheckAgy -- Yes --> UseAgy[AgyAdapter: Antigravity CLI]
     CheckAgy -- No --> Fail[Raise Explicit RuntimeError]
 ```
 
 ### Resolution Rules:
-1. **Priority Hierarchy**: Flag Override $\rightarrow$ Anthropic API $\rightarrow$ Antigravity (`agy` CLI) $\rightarrow$ Explicit Failure.
+1. **Priority Hierarchy**: Flag Override $\rightarrow$ Anthropic API (Claude) $\rightarrow$ OpenAI API (Codex/GPT-4o) $\rightarrow$ Antigravity (`agy` CLI) $\rightarrow$ Explicit Failure.
 2. **No Silent Mocking**: The engine will **never** silently fall back to `mock` if a real provider is unavailable. Mock execution requires an explicit `--provider mock` flag.
+
+### The OpenAI / Codex Adapter (`OpenAIAdapter`)
+Supports OpenAI's GPT-4o, Codex, and reasoning models (e.g. `o1`):
+- Uses `OPENAI_API_KEY` (and optional `OPENAI_BASE_URL` for custom endpoints, Azure, or local Ollama).
+- Formats native JSON function/tool schemas and processes tool calls with automatic cost tracking.
+- Accessible via `--provider openai` or `--provider codex`.
 
 ### The Antigravity Adapter (`AgyAdapter`)
 The `AgyAdapter` wraps Google's Antigravity CLI (`agy`) as an autonomous subprocess:

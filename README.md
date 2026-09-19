@@ -38,9 +38,13 @@ pip install -e .
 
 AIDLC resolves LLM providers strictly without silent fallback:
 1. `--provider <anthropic|agy|mock>` CLI flag.
+1. `--provider <anthropic|openai|codex|agy|mock>` CLI flag.
 2. `ANTHROPIC_API_KEY` environment variable (uses Claude 3.5 Sonnet).
 3. Authenticated local `agy` CLI session (`~/.local/bin/agy` or `PATH`).
 4. **Loud explicit error**: if neither Anthropic key nor agy is available, AIDLC halts with an error. The mock adapter is only used when `--provider mock` is explicitly provided.
+3. `OPENAI_API_KEY` environment variable (uses OpenAI GPT-4o / Codex).
+4. Authenticated local `agy` CLI session (`~/.local/bin/agy` or `PATH`).
+5. **Loud explicit error**: if no configured provider is found, AIDLC halts with an explicit error. The mock adapter is only used when `--provider mock` is explicitly provided.
 
 ---
 

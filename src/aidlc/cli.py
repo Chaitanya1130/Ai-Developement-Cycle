@@ -180,6 +180,8 @@ def render_intake_interview_summary(sm: StateManager, run_id: str) -> None:
     "--provider",
     type=click.Choice(["anthropic", "agy", "mock"], case_sensitive=False),
     help="LLM provider override (anthropic, agy, mock)",
+    type=click.Choice(["anthropic", "claude", "openai", "codex", "agy", "mock"], case_sensitive=False),
+    help="LLM provider override (anthropic, openai, codex, agy, mock)",
 )
 @click.option("--pipeline", is_flag=True, default=False, help="Run full pipeline from this phase")
 @click.option("-y", "--yes", is_flag=True, default=False, help="Automatically approve intake/interview without prompt")
